@@ -1,9 +1,12 @@
 import base64
 import json
+import os
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import cv2
 import mediapipe as mp
@@ -31,6 +34,16 @@ from openface import (
 
 ROOT = Path(__file__).resolve().parent
 MAX_REQUEST_SIZE = 4 * 1024 * 1024
+SESSION_TTL_SECONDS = 30 * 60
+MAX_ACTIVE_SESSIONS = 4
+ALLOWED_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.environ.get(
+        "CORS_ORIGINS",
+        "http://127.0.0.1:8000,http://localhost:8000",
+    ).split(",")
+    if origin.strip()
+}
 
 
 class RequestError(Exception):
@@ -40,9 +53,12 @@ class RequestError(Exception):
 
 
 class SignRecognizer:
-    def __init__(self):
+    def __init__(self, session_id):
         self.lock = threading.RLock()
-        self.templates_path = get_templates_path()
+        templates_path = get_templates_path()
+        self.templates_path = (
+            templates_path.parent / "web-sessions" / session_id / templates_path.name
+        )
         self.templates, self.template_labels = load_templates(self.templates_path)
         face_model_path = ROOT / "haarcascade_frontalface_default.xml"
         compatible_face_model_path = get_windows_compatible_path(face_model_path)
@@ -73,6 +89,7 @@ class SignRecognizer:
         self.missed_face_frames = 0
         self.last_timestamp_ms = 0
         self.text_accumulator = SignTextAccumulator()
+        self.last_used = time.monotonic()
 
     def process_frame(self, frame):
         frame = cv2.flip(frame, 1)
@@ -243,16 +260,43 @@ class SignRecognizer:
             raise RequestError("Неизвестная команда.")
 
 
-recognizer = None
+recognizers = {}
 recognizer_lock = threading.Lock()
 
 
-def get_recognizer():
-    global recognizer
+def parse_session_id(value):
+    if not isinstance(value, str):
+        raise RequestError("В запросе отсутствует идентификатор браузера.")
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as error:
+        raise RequestError("Некорректный идентификатор браузера.") from error
+
+
+def get_recognizer(session_id):
+    now = time.monotonic()
     with recognizer_lock:
-        if recognizer is None:
-            recognizer = SignRecognizer()
-        return recognizer
+        expired_sessions = [
+            key
+            for key, app in recognizers.items()
+            if now - app.last_used >= SESSION_TTL_SECONDS
+        ]
+        for key in expired_sessions:
+            app = recognizers.pop(key)
+            with app.lock:
+                app.landmarker.close()
+
+        app = recognizers.get(session_id)
+        if app is None:
+            if len(recognizers) >= MAX_ACTIVE_SESSIONS:
+                raise RequestError(
+                    "Сервер занят. Попробуйте открыть сайт позже.",
+                    503,
+                )
+            app = SignRecognizer(session_id)
+            recognizers[session_id] = app
+        app.last_used = now
+        return app
 
 
 class WebHandler(BaseHTTPRequestHandler):
@@ -262,8 +306,18 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        origin = self.headers.get("Origin")
+        if origin and origin.rstrip("/") in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
+
+    def _origin_is_allowed(self):
+        origin = self.headers.get("Origin")
+        return not origin or origin.rstrip("/") in ALLOWED_ORIGINS
 
     def _read_json(self):
         try:
@@ -281,6 +335,9 @@ class WebHandler(BaseHTTPRequestHandler):
         return payload
 
     def do_GET(self):
+        if not self._origin_is_allowed():
+            self._send_json({"error": "Источник запроса не разрешён."}, 403)
+            return
         if self.path == "/":
             page = (ROOT / "index.html").read_bytes()
             self.send_response(200)
@@ -289,20 +346,46 @@ class WebHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(page)
             return
-        if self.path == "/api/status":
+        parsed_path = urlsplit(self.path)
+        if parsed_path.path == "/api/status":
             try:
-                app = get_recognizer()
+                query = parse_qs(parsed_path.query)
+                session_id = parse_session_id(
+                    query.get("session_id", [None])[0]
+                )
+                app = get_recognizer(session_id)
                 with app.lock:
                     self._send_json(app.status())
+            except RequestError as error:
+                self._send_json({"error": str(error)}, error.status)
             except Exception as error:
                 self._send_json({"error": str(error)}, 500)
             return
         self._send_json({"error": "Страница не найдена."}, 404)
 
+    def do_OPTIONS(self):
+        if not self._origin_is_allowed():
+            self._send_json({"error": "Источник запроса не разрешён."}, 403)
+            return
+        self.send_response(204)
+        origin = self.headers.get("Origin")
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Vary", "Origin")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):
+        if not self._origin_is_allowed():
+            self._send_json({"error": "Источник запроса не разрешён."}, 403)
+            return
         try:
             payload = self._read_json()
-            app = get_recognizer()
+            session_id = parse_session_id(payload.get("session_id"))
+            app = get_recognizer(session_id)
             with app.lock:
                 if self.path == "/api/frame":
                     encoded_frame = payload.get("image")
@@ -349,8 +432,10 @@ class WebHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    server = ThreadingHTTPServer(("127.0.0.1", 8000), WebHandler)
-    print("Сайт запущен: http://127.0.0.1:8000")
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "8000"))
+    server = ThreadingHTTPServer((host, port), WebHandler)
+    print(f"Сайт запущен: http://{host}:{port}")
     print("Для остановки нажмите Ctrl+C.")
     try:
         server.serve_forever()
@@ -358,8 +443,10 @@ def main():
         print("\nСервер остановлен.")
     finally:
         server.server_close()
-        if recognizer is not None:
-            recognizer.landmarker.close()
+        for app in recognizers.values():
+            with app.lock:
+                app.landmarker.close()
+        recognizers.clear()
 
 
 if __name__ == "__main__":

@@ -93,7 +93,7 @@
           <div class="camera-placeholder">
             <div class="camera-icon">⌕</div>
             <strong>Включите камеру</strong>
-            <p>Разрешите доступ к камере в браузере. Изображение обрабатывается локально на этом компьютере.</p>
+            <p>Разрешите доступ к камере. Кадры будут отправляться по HTTPS на сервер распознавания.</p>
           </div>
           <canvas id="canvas" hidden></canvas>
         </div>
@@ -155,7 +155,11 @@
       </section>
     </div>
   </main>
+  <script src="config.js"></script>
   <script>
+    const API_BASE_URL = (window.APP_CONFIG && window.APP_CONFIG.API_BASE_URL || "").replace(/\/+$/, "");
+    const SESSION_STORAGE_KEY = "kazakhSignAlphabetSessionId";
+    const SESSION_ID = getOrCreateSessionId();
     const video = document.getElementById("video");
     const canvas = document.getElementById("canvas");
     const context = canvas.getContext("2d");
@@ -166,6 +170,27 @@
     let capturing = false;
     let requestInFlight = false;
     let cameraTimer = null;
+
+    function getOrCreateSessionId() {
+      let sessionId = localStorage.getItem(SESSION_STORAGE_KEY);
+      if (!sessionId) {
+        if (crypto.randomUUID) {
+          sessionId = crypto.randomUUID();
+        } else {
+          const bytes = crypto.getRandomValues(new Uint8Array(16));
+          bytes[6] = (bytes[6] & 0x0f) | 0x40;
+          bytes[8] = (bytes[8] & 0x3f) | 0x80;
+          const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+          sessionId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+        }
+        localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+      }
+      return sessionId;
+    }
+
+    function apiUrl(path) {
+      return `${API_BASE_URL}${path}`;
+    }
 
     function showError(message) {
       errorBox.textContent = message;
@@ -226,10 +251,10 @@
     }
 
     async function postJson(url, payload) {
-      const response = await fetch(url, {
+      const response = await fetch(apiUrl(url), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ ...payload, session_id: SESSION_ID })
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Не удалось выполнить запрос.");
@@ -289,12 +314,20 @@
 
     async function startCamera() {
       clearError();
+      if (location.hostname.endsWith("github.io") && !API_BASE_URL) {
+        showError("Сначала укажите адрес Python-сервера в файле config.js.");
+        return;
+      }
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         showError("Браузер не поддерживает доступ к камере. Откройте сайт через localhost в современном браузере.");
         return;
       }
       try {
-        const status = await fetch("/api/status").then(response => response.json());
+        const statusResponse = await fetch(
+          apiUrl(`/api/status?session_id=${encodeURIComponent(SESSION_ID)}`)
+        );
+        const status = await statusResponse.json();
+        if (!statusResponse.ok) throw new Error(status.error || "Не удалось подключиться к серверу.");
         updateStatus(status);
         stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
