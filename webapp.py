@@ -77,7 +77,7 @@ class SignRecognizer:
             min_tracking_confidence=0.65,
         )
         self.landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
-        self.calibration_mode = False
+        self.calibration_mode = len(self.templates) == 0
         self.calibration_index = 0
         self.recording_sequence = None
         self.sequence_buffer = []
@@ -337,15 +337,22 @@ class WebHandler(BaseHTTPRequestHandler):
         if not self._origin_is_allowed():
             self._send_json({"error": "Источник запроса не разрешён."}, 403)
             return
-        if self.path == "/":
-            page = (ROOT / "index.html").read_bytes()
+        parsed_path = urlsplit(self.path)
+        if parsed_path.path in ("/", "/config.js"):
+            asset_name = "index.html" if parsed_path.path == "/" else "config.js"
+            page = (ROOT / asset_name).read_bytes()
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            content_type = (
+                "text/html; charset=utf-8"
+                if asset_name == "index.html"
+                else "application/javascript; charset=utf-8"
+            )
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(page)))
+            self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(page)
             return
-        parsed_path = urlsplit(self.path)
         if parsed_path.path == "/api/status":
             try:
                 query = parse_qs(parsed_path.query)
