@@ -7,4 +7,4 @@ services:
     dockerContext: .
     envVars:
       - key: CORS_ORIGINS
-        value: https://baakha.github.io,https://langict.pryopj
+        value: https://baakha.github.io,https://langict.pryopj,https://kazakh-sign-api.onrender.com
