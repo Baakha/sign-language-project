@@ -21,7 +21,6 @@ from openface import (
     SignTextAccumulator,
     classify_gesture,
     detect_face,
-    draw_hand,
     get_model_path,
     get_templates_path,
     get_windows_compatible_path,
@@ -36,6 +35,7 @@ ROOT = Path(__file__).resolve().parent
 MAX_REQUEST_SIZE = 4 * 1024 * 1024
 SESSION_TTL_SECONDS = 30 * 60
 MAX_ACTIVE_SESSIONS = 4
+FACE_DETECTION_INTERVAL = 5
 ALLOWED_ORIGINS = {
     origin.strip().rstrip("/")
     for origin in os.environ.get(
@@ -84,9 +84,11 @@ class SignRecognizer:
         self.recognized_text = ""
         self.detected_letter = None
         self.hand_detected = False
+        self.hand_landmarks = []
         self.last_feature_vector = None
         self.last_face_box = None
-        self.missed_face_frames = 0
+        self.last_face_detection_frame = None
+        self.frame_count = 0
         self.last_timestamp_ms = 0
         self.text_accumulator = SignTextAccumulator()
         self.last_used = time.monotonic()
@@ -99,34 +101,30 @@ class SignRecognizer:
         self.last_timestamp_ms = timestamp_ms
         results = self.landmarker.detect_for_video(image, timestamp_ms)
         hand_landmarks = results.hand_landmarks[0] if results.hand_landmarks else None
-        face_box = detect_face(frame, self.face_detector)
-        if face_box is not None:
-            self.last_face_box = face_box
-            self.missed_face_frames = 0
-        elif (
-            self.last_face_box is not None
-            and self.missed_face_frames < FACE_TRACKING_GRACE_FRAMES
+        self.frame_count += 1
+        if self.frame_count % FACE_DETECTION_INTERVAL == 1:
+            face_box = detect_face(frame, self.face_detector)
+            if face_box is not None:
+                self.last_face_box = face_box
+                self.last_face_detection_frame = self.frame_count
+        if (
+            self.last_face_detection_frame is None
+            or self.frame_count - self.last_face_detection_frame
+            > FACE_TRACKING_GRACE_FRAMES
         ):
-            face_box = self.last_face_box
-            self.missed_face_frames += 1
-        else:
             self.last_face_box = None
+        face_box = self.last_face_box
 
         self.detected_letter = None
         self.hand_detected = hand_landmarks is not None
+        self.hand_landmarks = (
+            [(float(point.x), float(point.y)) for point in hand_landmarks]
+            if hand_landmarks
+            else []
+        )
         self.last_feature_vector = None
-        if face_box is not None:
-            face_x, face_y, face_width, face_height = face_box
-            cv2.rectangle(
-                frame,
-                (face_x, face_y),
-                (face_x + face_width, face_y + face_height),
-                (80, 180, 255),
-                2,
-            )
 
         if hand_landmarks:
-            draw_hand(frame, hand_landmarks)
             self.last_feature_vector = gesture_features(
                 hand_landmarks,
                 frame.shape,
@@ -200,6 +198,7 @@ class SignRecognizer:
             "completed_letters": int(completed_letters),
             "letters_total": len(LETTERS),
             "hand_detected": self.hand_detected,
+            "hand_landmarks": self.hand_landmarks,
         }
 
     def action(self, name):
@@ -401,19 +400,8 @@ class WebHandler(BaseHTTPRequestHandler):
                     )
                     if frame is None:
                         raise RequestError("Получен некорректный кадр камеры.")
-                    processed_frame = app.process_frame(frame)
-                    success, jpeg = cv2.imencode(
-                        ".jpg",
-                        processed_frame,
-                        [cv2.IMWRITE_JPEG_QUALITY, 78],
-                    )
-                    if not success:
-                        raise RuntimeError("Не удалось подготовить кадр для браузера.")
-                    response = {
-                        "image": base64.b64encode(jpeg).decode("ascii"),
-                        "status": app.status(),
-                    }
-                    self._send_json(response)
+                    app.process_frame(frame)
+                    self._send_json({"status": app.status()})
                 elif self.path == "/api/action":
                     name = payload.get("action")
                     if not isinstance(name, str):

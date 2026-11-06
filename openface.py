@@ -96,15 +96,28 @@ def hand_features(landmarks):
 
 def detect_face(frame, face_detector):
     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    height, width = gray_frame.shape
+    scale = min(1.0, 320 / width)
+    if scale < 1.0:
+        gray_frame = cv2.resize(
+            gray_frame,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA,
+        )
     faces = face_detector.detectMultiScale(
         gray_frame,
         scaleFactor=1.1,
         minNeighbors=5,
-        minSize=(60, 60),
+        minSize=(max(1, round(60 * scale)), max(1, round(60 * scale))),
     )
     if len(faces) == 0:
         return None
-    return max(faces, key=lambda face: face[2] * face[3])
+    face = max(faces, key=lambda item: item[2] * item[3])
+    if scale < 1.0:
+        return tuple(round(value / scale) for value in face)
+    return face
 
 
 def gesture_features(landmarks, frame_shape, face_box):

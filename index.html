@@ -28,9 +28,10 @@
     .card { min-width: 0; background: #161c26; border: 1px solid #29313e; border-radius: 18px; overflow: hidden; }
     .camera { position: relative; min-height: 300px; aspect-ratio: 4 / 3; background: #090c11; display: grid; place-items: center; }
     #processed { display: none; width: 100%; height: 100%; object-fit: contain; }
-    .camera.active #processed { display: block; }
-    .camera.active #video { display: none; }
-    #video { display: none; }
+    .camera.active #video { display: block; }
+    #video { display: none; width: 100%; height: 100%; object-fit: contain; transform: scaleX(-1); }
+    #overlay { display: none; position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; transform: scaleX(-1); }
+    .camera.active #overlay { display: block; }
     .camera-placeholder { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 12px; padding: 24px; text-align: center; color: #9aa6b8; }
     .camera.active .camera-placeholder { display: none; }
     .camera-placeholder strong { color: #e7edf5; font-size: 18px; }
@@ -90,6 +91,7 @@
         <div id="camera" class="camera">
           <video id="video" autoplay playsinline muted></video>
           <img id="processed" alt="Обработанное изображение с камеры">
+          <canvas id="overlay" aria-hidden="true"></canvas>
           <div class="camera-placeholder">
             <div class="camera-icon">⌕</div>
             <strong>Включите камеру</strong>
@@ -163,6 +165,8 @@
     const video = document.getElementById("video");
     const canvas = document.getElementById("canvas");
     const context = canvas.getContext("2d");
+    const overlay = document.getElementById("overlay");
+    const overlayContext = overlay.getContext("2d");
     const processed = document.getElementById("processed");
     const camera = document.getElementById("camera");
     const errorBox = document.getElementById("error");
@@ -170,6 +174,11 @@
     let capturing = false;
     let requestInFlight = false;
     let cameraTimer = null;
+    const HAND_CONNECTIONS = [
+      [0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8],
+      [5, 9], [9, 10], [10, 11], [11, 12], [9, 13], [13, 14], [14, 15],
+      [15, 16], [13, 17], [0, 17], [17, 18], [18, 19], [19, 20]
+    ];
 
     function getOrCreateSessionId() {
       let sessionId = localStorage.getItem(SESSION_STORAGE_KEY);
@@ -203,6 +212,7 @@
     }
 
     function updateStatus(status) {
+      drawHand(status.hand_landmarks || []);
       const connection = document.getElementById("connection");
       connection.textContent = status.hand_detected ? "Рука в кадре" : "Ожидание руки";
       connection.classList.toggle("ready", status.hand_detected);
@@ -250,6 +260,38 @@
         .forEach(button => button.disabled = status.recording_frames > 0);
     }
 
+    function drawHand(landmarks) {
+      const bounds = camera.getBoundingClientRect();
+      const pixelRatio = window.devicePixelRatio || 1;
+      overlay.width = Math.round(bounds.width * pixelRatio);
+      overlay.height = Math.round(bounds.height * pixelRatio);
+      overlayContext.scale(pixelRatio, pixelRatio);
+      overlayContext.clearRect(0, 0, bounds.width, bounds.height);
+      if (landmarks.length !== 21 || !video.videoWidth || !video.videoHeight) return;
+
+      const scale = Math.min(bounds.width / video.videoWidth, bounds.height / video.videoHeight);
+      const offsetX = (bounds.width - video.videoWidth * scale) / 2;
+      const offsetY = (bounds.height - video.videoHeight * scale) / 2;
+      const points = landmarks.map(([x, y]) => ({
+        x: offsetX + x * video.videoWidth * scale,
+        y: offsetY + y * video.videoHeight * scale
+      }));
+      overlayContext.strokeStyle = "#00dc64";
+      overlayContext.lineWidth = 2;
+      for (const [start, end] of HAND_CONNECTIONS) {
+        overlayContext.beginPath();
+        overlayContext.moveTo(points[start].x, points[start].y);
+        overlayContext.lineTo(points[end].x, points[end].y);
+        overlayContext.stroke();
+      }
+      overlayContext.fillStyle = "#ff5030";
+      for (const point of points) {
+        overlayContext.beginPath();
+        overlayContext.arc(point.x, point.y, 3, 0, Math.PI * 2);
+        overlayContext.fill();
+      }
+    }
+
     async function postJson(url, payload) {
       const response = await fetch(apiUrl(url), {
         method: "POST",
@@ -282,7 +324,7 @@
         return;
       }
       requestInFlight = true;
-      canvas.width = Math.min(video.videoWidth, 640);
+      canvas.width = Math.min(video.videoWidth, 480);
       canvas.height = Math.round(video.videoHeight * canvas.width / video.videoWidth);
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
       canvas.toBlob(async blob => {
@@ -299,7 +341,6 @@
             reader.readAsDataURL(blob);
           });
           const result = await postJson("/api/frame", { image });
-          processed.src = `data:image/jpeg;base64,${result.image}`;
           updateStatus(result.status);
           clearError();
         } catch (error) {
@@ -309,7 +350,7 @@
           requestInFlight = false;
           scheduleCapture();
         }
-      }, "image/jpeg", 0.72);
+      }, "image/jpeg", 0.65);
     }
 
     async function startCamera() {
@@ -323,12 +364,6 @@
         return;
       }
       try {
-        const statusResponse = await fetch(
-          apiUrl(`/api/status?session_id=${encodeURIComponent(SESSION_ID)}`)
-        );
-        const status = await statusResponse.json();
-        if (!statusResponse.ok) throw new Error(status.error || "Не удалось подключиться к серверу.");
-        updateStatus(status);
         stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
           audio: false
@@ -339,6 +374,17 @@
         camera.classList.add("active");
         document.getElementById("cameraButton").disabled = true;
         document.getElementById("stopButton").disabled = false;
+        try {
+          const statusResponse = await fetch(
+            apiUrl(`/api/status?session_id=${encodeURIComponent(SESSION_ID)}`)
+          );
+          const status = await statusResponse.json();
+          if (!statusResponse.ok) throw new Error(status.error || "Не удалось подключиться к серверу.");
+          updateStatus(status);
+        } catch (error) {
+          showError(`Камера включена, но сервер распознавания недоступен: ${error.message}`);
+          return;
+        }
         scheduleCapture(0);
       } catch (error) {
         showError(error.message || "Не удалось включить камеру. Проверьте разрешение на доступ.");
@@ -352,6 +398,7 @@
       stream = null;
       video.srcObject = null;
       camera.classList.remove("active");
+      overlayContext.clearRect(0, 0, overlay.width, overlay.height);
       document.getElementById("cameraButton").disabled = false;
       document.getElementById("stopButton").disabled = true;
       document.getElementById("connection").textContent = "Камера выключена";
